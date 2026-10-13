@@ -1,0 +1,13 @@
+[project]
+name = "sunix"
+version = "0.1.0"
+description = "Personal Spotify recorder for Linux"
+requires-python = ">=3.14"
+# No Python dependencies. We use stdlib + ffmpeg + pw-record.
+# System packages required: python-dbus, python-gobject, pipewire (pw-record),
+# ffmpeg. Create the venv with `uv venv --system-site-packages` so the
+# system-installed dbus-python and PyGObject are visible.
+
+[tool.uv]
+# Don't try to install Python deps; we have none.
+package = false
