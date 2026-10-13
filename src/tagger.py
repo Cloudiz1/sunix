@@ -38,6 +38,21 @@ class TrackMetadata:
     cover_jpg: bytes | None  # 300x300 JPG, or None if unavailable
 
 
+def parse_spotify_id(trackid: str) -> str:
+    """Extract the bare Spotify track id from any of:
+      - `spotify:track:XXXX` (Spotify URI form)
+      - `/com/spotify/track/XXXX` (MPRIS form, D-Bus object path)
+      - just `XXXX`
+
+    Returns "" if the input doesn't contain a recognizable id.
+    """
+    for sep in ("/", ":"):
+        if sep in trackid:
+            trackid = trackid.rsplit(sep, 1)[-1]
+            break
+    return trackid or ""
+
+
 class Tagger:
     def __init__(self, cfg: SpotifyConfig) -> None:
         self._cfg = cfg
@@ -47,17 +62,9 @@ class Tagger:
     def lookup(self, trackid: str) -> TrackMetadata | None:
         """Fetch canonical metadata + cover art for a Spotify track id.
 
-        `trackid` may be either:
-          - `spotify:track:XXXX` (Spotify URI form)
-          - `/com/spotify/track/XXXX` (MPRIS form, D-Bus object path)
-          - just `XXXX`
         Returns None on any error; callers should fall back to MPRIS metadata.
         """
-        # Strip any URI/path prefix to get just the track id.
-        for sep in ("/", ":"):
-            if sep in trackid:
-                trackid = trackid.rsplit(sep, 1)[-1]
-                break
+        trackid = parse_spotify_id(trackid)
         if not trackid:
             return None
 
@@ -73,8 +80,7 @@ class Tagger:
         artists = [a["name"] for a in data.get("artists", []) if "name" in a]
         album_obj = data.get("album", {})
 
-        # Genres live on the artist object in older API responses, but
-        # /tracks/{id} doesn't include them. Try the first artist's page.
+        # Genres live on the artist object, not on /tracks.
         genre: str | None = None
         if artists:
             artist_id = data["artists"][0].get("id")
@@ -104,7 +110,6 @@ class Tagger:
         if not images:
             return None
 
-        # Sort by area, prefer the one closest to 300x300.
         target = 300 * 300
         best = min(images, key=lambda img: abs((img.get("width", 0) * img.get("height", 0)) - target))
         url = best.get("url")

@@ -8,13 +8,16 @@ Architecture:
                                     │
                                     ▼
                           on track-change:
-                            swap current file (close old, attach new)
-                            spawn encode_async(old_pcm) → MP3
+                            finalize previous (close PCM, encode MP3)
+                            if ad or already recorded → write to duplicate.pcm
+                            else → open new PCM, attach router
 
 The pump runs for the whole session. Each track-change closes the
-previous PCM file (atomically, under lock) and redirects the pump to
-a new file. Encoding happens in a background thread per track, so the
-main loop can keep going while ffmpeg chews through prior tracks.
+previous PCM file (atomically, under lock) and either:
+  - redirects to duplicate.pcm (skip case: ad or already-recorded), or
+  - opens a new PCM and redirects (real new track).
+Encoding happens in a background thread per track, so the main loop
+can keep going while ffmpeg chews through prior tracks.
 
 Run with: `uv run -m src.main`
 """
@@ -23,7 +26,6 @@ from __future__ import annotations
 
 import datetime
 import os
-import shutil
 import signal
 import sys
 import tempfile
@@ -34,6 +36,7 @@ from typing import IO, Optional
 from . import ads
 from . import capture
 from . import config as cfg
+from . import library
 from . import mpris
 from . import pipeline
 from . import tagger
@@ -62,25 +65,30 @@ def record() -> None:
     router = PumpRouter(cap.process.stdout, log=log)
     router.start()
 
+    lib = library.Library(out_dir / ".sunix.db")
+    log.write("library opened")
+
+    duplicate_path = out_dir / "duplicate.pcm"
+    duplicate_path.write_bytes(b"")  # truncate on startup
+    duplicate_file = open(duplicate_path, "ab")
+    router.swap(duplicate_file)
+
     state = RecorderState(
         router=router,
         tagger=tagger.Tagger(cfg_obj.spotify),
+        library=lib,
         out_dir=out_dir,
         log=log,
+        duplicate_path=duplicate_path,
     )
 
-    def on_track_change(info: mpris.TrackInfo) -> None:
-        state.on_track_change(info)
-
     listener = mpris.MprisListener(
-        on_track_change=on_track_change,
+        on_track_change=lambda info: state.on_track_change(info),
         on_disappeared=lambda: log.write("Spotify disappeared; exiting"),
     )
 
     def sigint(_signum, _frame):
         log.write("SIGINT received; finalizing")
-        # Run finalization on the main thread, then quit the GLib loop
-        # so listener.run() returns and we hit the cleanup path.
         state.finalize_pending()
         listener.stop()
 
@@ -89,11 +97,12 @@ def record() -> None:
     log.write("listening for track changes...")
     listener.run()
 
-    # Either SIGINT fired (already finalized) or Spotify disappeared.
-    # Finalize again in case SIGINT handler didn't run.
     state.finalize_pending()
     router.stop()
     capture.stop(cap)
+    duplicate_file.close()
+    duplicate_path.unlink(missing_ok=True)
+    lib.close()
     log.write("=== session ended ===")
 
 
@@ -128,10 +137,6 @@ class PumpRouter:
         Returns the previous file (now closed) so the caller can hand
         it off to the encoder. Returns None if there was no previous
         file.
-
-        All file mutations happen under the lock. The pump holds the
-        lock for the duration of one `write()` call only, so blocking
-        the main thread is brief.
         """
         with self._lock:
             old = self._current
@@ -161,7 +166,7 @@ class PumpRouter:
 # --- recorder state --------------------------------------------------------
 
 class RecorderState:
-    """Tracks the current PCM file + the metadata about to be applied.
+    """Owns the current PCM file + the metadata about to be applied.
 
     Lives on the main thread. The pump thread doesn't touch this.
     """
@@ -170,41 +175,52 @@ class RecorderState:
         self,
         router: PumpRouter,
         tagger: tagger.Tagger,
+        library: library.Library,
         out_dir: Path,
         log: "SessionLog",
+        duplicate_path: Path,
     ) -> None:
         self._router = router
         self._tagger = tagger
+        self._library = library
         self._out_dir = out_dir
         self._log = log
+        self._duplicate_path = duplicate_path
 
-        # The PCM file currently receiving audio (open, writable).
-        self._current_file: Optional[IO[bytes]] = None
+        # The PCM file currently receiving audio for the current track.
         self._current_path: Optional[Path] = None
-        # The metadata we'll use when this track's PCM gets encoded.
         self._current_meta: Optional[tagger.TrackMetadata] = None
         self._current_cover: Optional[Path] = None
+        self._current_id: Optional[str] = None
 
     def on_track_change(self, info: mpris.TrackInfo) -> None:
         self._log.write(
             f"track change: trackid={info.trackid} artist={info.artist!r} title={info.title!r}"
         )
 
-        if ads.is_ad({"trackid": info.trackid}):
-            self._log.write("  -> ad detected, skipping")
-            # Don't open a new file. Pump continues writing to the
-            # previous track's PCM (which we'll encode normally).
-            # Actually no — we want to NOT accumulate this audio.
-            # Simplest: keep current file as-is; the ad audio becomes
-            # part of the previous track's tail. Acceptable for an
-            # ad-skipping tool that doesn't try to surgically cut.
-            # If we wanted to be precise we'd open a dummy sink; not worth it.
-            return
-
-        # 1. Hand the previous track off to encoding.
+        # Always finalize the previous track first, regardless of what
+        # we'll do with the new one.
         self.finalize_pending()
 
-        # 2. Look up canonical metadata.
+        # Ad: redirect pump to duplicate.pcm, don't open new PCM.
+        if ads.is_ad({"trackid": info.trackid}):
+            self._attach_duplicate()
+            self._log.write("  -> ad, writing to duplicate.pcm")
+            return
+
+        bare_id = tagger.parse_spotify_id(info.trackid)
+        if not bare_id:
+            # Unparseable; treat like ad.
+            self._attach_duplicate()
+            self._log.write("  -> unparseable trackid, writing to duplicate.pcm")
+            return
+
+        if self._library.has(bare_id):
+            self._attach_duplicate()
+            self._log.write(f"  -> already recorded, writing to duplicate.pcm")
+            return
+
+        # Real new track: look up metadata, open PCM, attach.
         meta = self._tagger.lookup(info.trackid)
         if meta is None:
             self._log.write("  -> Web API lookup failed; using MPRIS metadata with empty tags")
@@ -218,7 +234,6 @@ class RecorderState:
                 cover_jpg=None,
             )
 
-        # 3. Write cover art to a temp file (so the encoder can find it).
         cover_path: Optional[Path] = None
         if meta.cover_jpg:
             fd, cover_name = tempfile.mkstemp(suffix=".jpg", prefix="sunix-cover-")
@@ -226,46 +241,37 @@ class RecorderState:
                 cf.write(meta.cover_jpg)
             cover_path = Path(cover_name)
 
-        # 4. Open a new PCM file for this track.
         fd, pcm_name = tempfile.mkstemp(suffix=".pcm", prefix="sunix-")
         pcm_file = os.fdopen(fd, "wb")
         pcm_path = Path(pcm_name)
 
-        # 5. Atomically redirect the pump to the new file.
         self._router.swap(pcm_file)
 
-        # 6. Stash state for the next finalize_pending().
-        self._current_file = pcm_file
         self._current_path = pcm_path
         self._current_meta = meta
         self._current_cover = cover_path
+        self._current_id = bare_id
 
         self._log.write(f"  -> recording: {meta.artist} - {meta.title}")
 
     def finalize_pending(self) -> None:
-        """Close the current PCM file (if any) and hand it to the encoder."""
-        # Swap returns the previous file. Passing None as the new file
-        # detaches the pump — bytes from pw-record go nowhere until a
-        # new track opens. This is fine; pw-record's stdout pipe is
-        # bounded and we won't block for long.
+        """Close the current track's PCM file (if any) and hand it to the encoder."""
         old_file = self._router.swap(None)
-        # Swap already closed old_file.
+        # swap() already closed old_file.
 
         pcm_path = self._current_path
         meta = self._current_meta
         cover_path = self._current_cover
+        bare_id = self._current_id
 
-        # Reset state regardless of whether we have a valid track to encode.
-        self._current_file = None
         self._current_path = None
         self._current_meta = None
         self._current_cover = None
+        self._current_id = None
 
         if pcm_path is None or old_file is None:
             return
 
-        # If the PCM is empty or very small, drop it. Probably an ad
-        # boundary or a fast skip that produced no audio.
         try:
             size = pcm_path.stat().st_size
         except OSError:
@@ -290,7 +296,16 @@ class RecorderState:
             final_mp3_path=final_path,
         )
         pipeline.encode_async(req)
+        if bare_id is not None:
+            self._library.add(bare_id)
         self._log.write(f"  -> encoding: {final_path.name}")
+
+    def _attach_duplicate(self) -> None:
+        """Redirect the pump to duplicate.pcm for unwanted audio."""
+        # Append mode so we don't truncate whatever's already there.
+        # On exit we delete the file, so it doesn't accumulate.
+        dup_file = open(self._duplicate_path, "ab")
+        self._router.swap(dup_file)
 
 
 # --- session log -----------------------------------------------------------

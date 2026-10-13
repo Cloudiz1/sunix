@@ -2,6 +2,8 @@ recordings/
 sunix-*.pcm
 sunix-*.jpg
 sunix-*.mp3
+duplicate.pcm
+.sunix.db
 .venv/
 __pycache__/
 *.pyc
